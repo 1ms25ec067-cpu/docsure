@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+python-multipart
+pymupdf
+pillow
+httpx
+pytest
+playwright
