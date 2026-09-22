@@ -17,7 +17,8 @@
       "reason": null
     },
     "created_at": "2026-09-22T06:28:22.437083+00:00",
-    "synced": false
+    "synced": true,
+    "synced_at": "2026-09-22T09:42:21.499292+00:00"
   },
   {
     "event_id": "OFF-AF9C74A1",
@@ -37,6 +38,49 @@
       "reason": null
     },
     "created_at": "2026-09-22T06:37:08.925767+00:00",
-    "synced": false
+    "synced": true,
+    "synced_at": "2026-09-22T09:42:21.499292+00:00"
+  },
+  {
+    "event_id": "OFF-35989DA1",
+    "event_type": "DOCUMENT_VALIDATION",
+    "application_id": "APP-OFFLINE-001",
+    "result": {
+      "filename": "DOC-1DD97BBF_fictional_income_certificate_demo.pdf",
+      "document_type": "UNKNOWN",
+      "size_bytes": 2905,
+      "max_size_bytes": 5242880,
+      "file_type_valid": true,
+      "readable": true,
+      "size_valid": true,
+      "page_count": 1,
+      "sha256": "e1eb819f5c27139ccb94a7f38977ea01eae03bebeb45084e320c288cea367867",
+      "status": "VERIFIED",
+      "reason": null
+    },
+    "created_at": "2026-09-22T09:42:21.474840+00:00",
+    "synced": true,
+    "synced_at": "2026-09-22T09:42:21.499292+00:00"
+  },
+  {
+    "event_id": "OFF-B2E7C78A",
+    "event_type": "DOCUMENT_VALIDATION",
+    "application_id": "APP-OFFLINE-001",
+    "result": {
+      "filename": "DOC-1DD97BBF_fictional_income_certificate_demo.pdf",
+      "document_type": "UNKNOWN",
+      "size_bytes": 2905,
+      "max_size_bytes": 5242880,
+      "file_type_valid": true,
+      "readable": true,
+      "size_valid": true,
+      "page_count": 1,
+      "sha256": "e1eb819f5c27139ccb94a7f38977ea01eae03bebeb45084e320c288cea367867",
+      "status": "VERIFIED",
+      "reason": null
+    },
+    "created_at": "2026-09-22T09:44:10.817338+00:00",
+    "synced": true,
+    "synced_at": "2026-09-22T09:44:10.841663+00:00"
   }
 ]
