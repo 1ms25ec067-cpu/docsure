@@ -382,7 +382,7 @@ export default function App() {
     useState("");
 
   const [browserUrl, setBrowserUrl] =
-    useState("http://127.0.0.1:8000/test-application");
+    useState("https://form.jotform.com/262642652527056");
 
   const [browserName, setBrowserName] =
     useState("Test User");
@@ -2391,8 +2391,25 @@ export default function App() {
                   onChange={(event) =>
                     setBrowserUrl(event.target.value)
                   }
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-50"
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-50 font-mono text-xs"
                 />
+
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setBrowserUrl("https://form.jotform.com/262642652527056")}
+                    className="rounded-lg border border-blue-200 bg-blue-50 px-2.5 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-100"
+                  >
+                    Public Jotform Target
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBrowserUrl("http://127.0.0.1:8000/test-application")}
+                    className="rounded-lg border border-slate-200 bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-200"
+                  >
+                    Local Test Application
+                  </button>
+                </div>
               </label>
 
               <div className="rounded-2xl border border-blue-100 bg-blue-50 p-4">
