@@ -1,12 +1,29 @@
 from typing import Any
+from urllib.parse import urlparse
+
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from app.verification.store import evidence_store
 
 
 class WebsiteApplicationAgent:
+    """
+    Evidence-gated browser automation agent.
+
+    Workflow:
+        OPEN
+        -> DISCOVER
+        -> MAP
+        -> FILL
+        -> READ-BACK
+        -> SUBMIT
+        -> INDEPENDENT CONFIRMATION
+
+    The agent never treats filling a form as proof of submission.
+    """
+
     def __init__(self):
-        self.source = "docsure_browser_agent"
+        self.timeout = 15000
 
     def run(
         self,
@@ -15,358 +32,454 @@ class WebsiteApplicationAgent:
         submit: bool = True,
     ) -> dict[str, Any]:
 
-        evidence = []
+        result = {
+            "status": "BLOCKED",
+            "reason": None,
+            "url": url,
+            "final_url": None,
+            "verification": [],
+            "evidence": [],
+        }
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-proxy-server",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+
+            page = browser.new_page(
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                }
             )
-
-            context = browser.new_context(
-                ignore_https_errors=True,
-            )
-
-            page = context.new_page()
 
             try:
-                response = page.goto(
+                # ---------------------------------------------------------
+                # 1. OPEN WEBSITE
+                # ---------------------------------------------------------
+                page.goto(
                     url,
                     wait_until="domcontentloaded",
-                    timeout=30000,
+                    timeout=self.timeout,
                 )
 
-                page.wait_for_timeout(1000)
-
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
-                        claim="Target application website was opened.",
-                        value={
-                            "url": page.url,
-                            "title": page.title(),
-                            "http_status": response.status if response else None,
-                        },
-                        verdict="VERIFIED",
-                        evidence_type="WEBSITE_OPEN",
-                        metadata={
-                            "requested_url": url,
-                        },
+                try:
+                    page.wait_for_load_state(
+                        "networkidle",
+                        timeout=5000,
                     )
+                except PlaywrightTimeoutError:
+                    pass
+
+                final_url = page.url
+                title = page.title()
+
+                result["final_url"] = final_url
+
+                website_open_evidence = evidence_store.add(
+                    source="docsure_browser_agent",
+                    claim="Target application website was opened.",
+                    value={
+                        "url": final_url,
+                        "title": title,
+                        "http_status": 200,
+                    },
+                    verdict="VERIFIED",
+                    evidence_type="WEBSITE_OPEN",
+                    metadata={
+                        "requested_url": url,
+                    },
                 )
 
+                result["evidence"].append(website_open_evidence)
+
+                # Detect obvious login pages.
+                if self._is_login_page(page):
+                    result["status"] = "BLOCKED"
+                    result["reason"] = "LOGIN_REQUIRED"
+
+                    result["verification"].append(
+                        {
+                            "status": "BLOCKED",
+                            "reason": "LOGIN_REQUIRED",
+                            "url": page.url,
+                        }
+                    )
+
+                    return result
+
+                # ---------------------------------------------------------
+                # 2. DISCOVER FORM FIELDS
+                # ---------------------------------------------------------
                 fields = self._discover_fields(page)
 
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
-                        claim="Application form fields were inspected.",
-                        value={
-                            "field_count": len(fields),
-                            "fields": fields,
-                        },
-                        verdict="VERIFIED",
-                        evidence_type="FORM_DISCOVERY",
-                        metadata={
-                            "url": page.url,
-                        },
-                    )
+                discovery_evidence = evidence_store.add(
+                    source="docsure_browser_agent",
+                    claim="Application form fields were inspected.",
+                    value={
+                        "field_count": len(fields),
+                        "fields": [
+                            {
+                                "label": field["label"],
+                                "type": field["type"],
+                                "name": field["name"],
+                                "id": field["id"],
+                                "placeholder": field["placeholder"],
+                                "aria_label": field["aria_label"],
+                            }
+                            for field in fields
+                        ],
+                    },
+                    verdict="VERIFIED",
+                    evidence_type="FORM_DISCOVERY",
+                    metadata={
+                        "url": page.url,
+                    },
                 )
 
-                mappings = []
+                result["evidence"].append(discovery_evidence)
 
-                for source_field, value in field_values.items():
-                    target = self._find_matching_field(
-                        source_field,
-                        fields,
+                if not fields:
+                    result["status"] = "BLOCKED"
+                    result["reason"] = "NO_FORM_FIELDS"
+
+                    result["verification"].append(
+                        {
+                            "status": "BLOCKED",
+                            "reason": "NO_FORM_FIELDS",
+                        }
                     )
 
-                    if target is None:
-                        evidence.append(
-                            evidence_store.add(
-                                source=self.source,
-                                claim="Every required verified data field can be safely mapped to the website.",
-                                value={
-                                    "missing_field": source_field,
-                                    "available_fields": fields,
-                                },
-                                verdict="BLOCKED",
-                                evidence_type="FIELD_MAPPING",
-                                metadata={
-                                    "reason": "FIELD_NOT_FOUND",
-                                },
-                            )
+                    return result
+
+                # ---------------------------------------------------------
+                # 3. MAP VERIFIED DATA TO WEBSITE FIELDS
+                # ---------------------------------------------------------
+                mappings = []
+
+                for source_field, expected_value in field_values.items():
+
+                    field = self._find_matching_field(
+                        page=page,
+                        fields=fields,
+                        source_field=source_field,
+                    )
+
+                    if field is None:
+                        mapping_evidence = evidence_store.add(
+                            source="docsure_browser_agent",
+                            claim="Verified document data was mapped to website fields.",
+                            value={
+                                "source_field": source_field,
+                                "website_field": None,
+                                "value": expected_value,
+                            },
+                            verdict="BLOCKED",
+                            evidence_type="FIELD_MAPPING",
+                            metadata={
+                                "reason": "FIELD_NOT_FOUND",
+                            },
                         )
 
-                        return {
-                            "status": "BLOCKED",
-                            "reason": "FIELD_NOT_FOUND",
-                            "url": url,
-                            "field": source_field,
-                            "available_fields": fields,
-                            "evidence": evidence,
-                        }
+                        result["evidence"].append(mapping_evidence)
+
+                        result["status"] = "BLOCKED"
+                        result["reason"] = "FIELD_MAPPING_FAILED"
+
+                        result["verification"].append(
+                            {
+                                "field": source_field,
+                                "verified": False,
+                                "reason": "FIELD_NOT_FOUND",
+                            }
+                        )
+
+                        return result
 
                     mappings.append(
                         {
                             "source_field": source_field,
-                            "website_field": target["label"],
-                            "value": value,
+                            "website_field": field,
+                            "value": expected_value,
                         }
                     )
 
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
-                        claim="Verified document data was mapped to website fields.",
-                        value={
-                            "mapping": mappings,
-                        },
-                        verdict="VERIFIED",
-                        evidence_type="FIELD_MAPPING",
-                        metadata={
-                            "mapped_fields": len(mappings),
-                        },
-                    )
+                mapping_evidence = evidence_store.add(
+                    source="docsure_browser_agent",
+                    claim="Verified document data was mapped to website fields.",
+                    value={
+                        "mapping": [
+                            {
+                                "source_field": item["source_field"],
+                                "website_field": item["website_field"]["label"],
+                                "value": item["value"],
+                            }
+                            for item in mappings
+                        ]
+                    },
+                    verdict="VERIFIED",
+                    evidence_type="FIELD_MAPPING",
+                    metadata={
+                        "mapped_fields": len(mappings),
+                    },
                 )
 
+                result["evidence"].append(mapping_evidence)
+
+                # ---------------------------------------------------------
+                # 4. FILL FIELDS
+                # ---------------------------------------------------------
                 filled = []
 
-                for source_field, value in field_values.items():
-                    target = self._find_matching_field(
-                        source_field,
-                        fields,
+                for item in mappings:
+                    success = self._fill_field(
+                        page=page,
+                        field=item["website_field"],
+                        value=item["value"],
                     )
 
-                    try:
-                        self._fill_field(page, target, value)
+                    if not success:
+                        filling_evidence = evidence_store.add(
+                            source="docsure_browser_agent",
+                            claim="Mapped application fields were filled.",
+                            value={
+                                "source_field": item["source_field"],
+                                "website_field": item["website_field"]["label"],
+                                "value": item["value"],
+                            },
+                            verdict="BLOCKED",
+                            evidence_type="FORM_FILLING",
+                            metadata={
+                                "reason": "FIELD_FILL_FAILED",
+                            },
+                        )
 
-                        filled.append(
+                        result["evidence"].append(filling_evidence)
+
+                        result["status"] = "BLOCKED"
+                        result["reason"] = "FORM_FILL_FAILED"
+
+                        return result
+
+                    filled.append(item)
+
+                filling_evidence = evidence_store.add(
+                    source="docsure_browser_agent",
+                    claim="Mapped application fields were filled.",
+                    value={
+                        "filled_count": len(filled),
+                        "fields": [
                             {
-                                "source_field": source_field,
-                                "website_field": target["label"],
-                                "value": value,
+                                "source_field": item["source_field"],
+                                "website_field": item["website_field"]["label"],
+                                "value": item["value"],
                             }
-                        )
-
-                    except Exception as error:
-                        evidence.append(
-                            evidence_store.add(
-                                source=self.source,
-                                claim="Mapped application fields were filled.",
-                                value={
-                                    "field": source_field,
-                                    "error": str(error),
-                                },
-                                verdict="BLOCKED",
-                                evidence_type="FORM_FILLING",
-                                metadata={
-                                    "reason": "FIELD_FILL_FAILED",
-                                },
-                            )
-                        )
-
-                        return {
-                            "status": "BLOCKED",
-                            "reason": "FIELD_FILL_FAILED",
-                            "field": source_field,
-                            "error": str(error),
-                            "evidence": evidence,
-                        }
-
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
-                        claim="Mapped application fields were filled.",
-                        value={
-                            "filled_count": len(filled),
-                            "fields": filled,
-                        },
-                        verdict="VERIFIED",
-                        evidence_type="FORM_FILLING",
-                        metadata={
-                            "field_count": len(filled),
-                        },
-                    )
+                            for item in filled
+                        ],
+                    },
+                    verdict="VERIFIED",
+                    evidence_type="FORM_FILLING",
+                    metadata={
+                        "field_count": len(filled),
+                    },
                 )
 
-                verification = []
+                result["evidence"].append(filling_evidence)
 
-                for source_field, expected in field_values.items():
-                    target = self._find_matching_field(
-                        source_field,
-                        fields,
+                # Allow React/Google Forms JavaScript to settle.
+                page.wait_for_timeout(500)
+
+                # ---------------------------------------------------------
+                # 5. READ-BACK VERIFICATION
+                # ---------------------------------------------------------
+                verification_results = []
+
+                for item in filled:
+                    actual_value = self._read_field(
+                        page=page,
+                        field=item["website_field"],
                     )
 
-                    actual = self._read_field(
-                        page,
-                        target,
+                    expected_value = str(item["value"]).strip()
+                    actual_value = str(actual_value or "").strip()
+
+                    verified = (
+                        actual_value == expected_value
                     )
 
-                    verified = str(actual).strip() == str(expected).strip()
-
-                    verification.append(
+                    verification_results.append(
                         {
-                            "field": target["label"],
-                            "expected": expected,
-                            "actual": actual,
+                            "field": item["website_field"]["label"],
+                            "expected": expected_value,
+                            "actual": actual_value,
                             "verified": verified,
                         }
                     )
 
-                    if not verified:
-                        evidence.append(
-                            evidence_store.add(
-                                source=self.source,
-                                claim="All entered values were independently read back and verified.",
-                                value={
-                                    "verification": "FORM_VALUES_NOT_CONFIRMED",
-                                    "fields": verification,
-                                },
-                                verdict="BLOCKED",
-                                evidence_type="FORM_VALUE_VERIFICATION",
-                                metadata={
-                                    "reason": "VALUE_MISMATCH",
-                                },
-                            )
-                        )
+                all_verified = all(
+                    item["verified"]
+                    for item in verification_results
+                )
 
-                        return {
-                            "status": "BLOCKED",
-                            "reason": "FORM_VALUES_NOT_CONFIRMED",
-                            "verification": verification,
-                            "evidence": evidence,
-                        }
+                if not all_verified:
 
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
+                    readback_evidence = evidence_store.add(
+                        source="docsure_browser_agent",
                         claim="All entered values were independently read back and verified.",
                         value={
-                            "verification": "FORM_VALUES_CONFIRMED",
-                            "fields": verification,
+                            "verification": "FORM_VALUES_NOT_CONFIRMED",
+                            "fields": verification_results,
                         },
-                        verdict="VERIFIED",
+                        verdict="BLOCKED",
                         evidence_type="FORM_VALUE_VERIFICATION",
                         metadata={
-                            "verified_fields": len(verification),
+                            "reason": "VALUE_MISMATCH",
                         },
                     )
+
+                    result["evidence"].append(readback_evidence)
+
+                    result["status"] = "BLOCKED"
+                    result["reason"] = "FORM_VALUES_NOT_CONFIRMED"
+                    result["verification"] = verification_results
+
+                    return result
+
+                readback_evidence = evidence_store.add(
+                    source="docsure_browser_agent",
+                    claim="All entered values were independently read back and verified.",
+                    value={
+                        "verification": "FORM_VALUES_CONFIRMED",
+                        "fields": verification_results,
+                    },
+                    verdict="VERIFIED",
+                    evidence_type="FORM_VALUE_VERIFICATION",
+                    metadata={
+                        "field_count": len(verification_results),
+                    },
                 )
 
+                result["evidence"].append(readback_evidence)
+
+                result["verification"] = verification_results
+
+                # ---------------------------------------------------------
+                # 6. SUBMISSION
+                # ---------------------------------------------------------
                 if not submit:
-                    return {
-                        "status": "VERIFIED",
-                        "reason": "FORM_FILLED_AND_VERIFIED",
-                        "url": url,
-                        "verification": verification,
-                        "evidence": evidence,
-                    }
+                    result["status"] = "VERIFIED"
+                    result["reason"] = "FORM_VALUES_CONFIRMED"
+                    return result
 
-                self._submit(page)
+                submitted = self._submit(page)
 
-                page.wait_for_load_state(
-                    "domcontentloaded",
-                    timeout=10000,
-                )
+                if not submitted:
+                    submission_evidence = evidence_store.add(
+                        source="docsure_browser_agent",
+                        claim="Application form was submitted.",
+                        value={
+                            "submission_attempted": True,
+                            "verification": "SUBMISSION_NOT_CONFIRMED",
+                        },
+                        verdict="BLOCKED",
+                        evidence_type="SUBMISSION_VERIFICATION",
+                        metadata={
+                            "reason": "SUBMIT_BUTTON_NOT_FOUND",
+                        },
+                    )
 
+                    result["evidence"].append(submission_evidence)
+
+                    result["status"] = "BLOCKED"
+                    result["reason"] = "SUBMISSION_NOT_CONFIRMED"
+
+                    return result
+
+                # Give the destination page time to update.
                 page.wait_for_timeout(1000)
 
+                # ---------------------------------------------------------
+                # 7. INDEPENDENT SUBMISSION CONFIRMATION
+                # ---------------------------------------------------------
                 confirmation = self._detect_submission(page)
 
                 if confirmation["confirmed"]:
+
                     submission_evidence = evidence_store.add(
-                        source=self.source,
-                        claim="Application reached a confirmed submitted state.",
+                        source="docsure_browser_agent",
+                        claim="Application submission was independently confirmed.",
                         value={
                             "verification": "SUBMISSION_CONFIRMED",
-                            "final_url": page.url,
-                            "confirmation_text": confirmation["text"],
+                            "url": page.url,
+                            "confirmation_signal": confirmation["signal"],
                         },
                         verdict="VERIFIED",
                         evidence_type="SUBMISSION_VERIFICATION",
                         metadata={
-                            "reason": "CONFIRMATION_DETECTED",
-                        },
-                    )
-
-                    evidence.append(submission_evidence)
-
-                    return {
-                        "status": "VERIFIED",
-                        "reason": "APPLICATION_SUBMITTED_AND_VERIFIED",
-                        "final_url": page.url,
-                        "verification": verification,
-                        "submission": confirmation,
-                        "evidence": evidence,
-                    }
-
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
-                        claim="Application reached a confirmed submitted state.",
-                        value={
-                            "verification": "SUBMISSION_NOT_CONFIRMED",
+                            "requested_url": url,
                             "final_url": page.url,
                         },
-                        verdict="BLOCKED",
-                        evidence_type="SUBMISSION_VERIFICATION",
-                        metadata={
-                            "reason": "UNKNOWN_SUBMISSION_STATE",
-                        },
                     )
+
+                    result["evidence"].append(submission_evidence)
+
+                    result["status"] = "VERIFIED"
+                    result["reason"] = "SUBMISSION_CONFIRMED"
+                    result["final_url"] = page.url
+
+                    return result
+
+                submission_evidence = evidence_store.add(
+                    source="docsure_browser_agent",
+                    claim="Application submission was independently confirmed.",
+                    value={
+                        "verification": "SUBMISSION_NOT_CONFIRMED",
+                        "url": page.url,
+                    },
+                    verdict="BLOCKED",
+                    evidence_type="SUBMISSION_VERIFICATION",
+                    metadata={
+                        "reason": "NO_CONFIRMATION_SIGNAL",
+                    },
                 )
 
-                return {
-                    "status": "BLOCKED",
-                    "reason": "SUBMISSION_NOT_CONFIRMED",
-                    "final_url": page.url,
-                    "verification": verification,
-                    "evidence": evidence,
-                }
+                result["evidence"].append(submission_evidence)
 
-            except PlaywrightTimeoutError as error:
-                evidence.append(
-                    evidence_store.add(
-                        source=self.source,
-                        claim="Website automation completed without a browser timeout.",
-                        value={
-                            "url": url,
-                            "error": str(error),
-                        },
-                        verdict="BLOCKED",
-                        evidence_type="BROWSER_ERROR",
-                        metadata={
-                            "reason": "TIMEOUT",
-                        },
-                    )
-                )
+                result["status"] = "BLOCKED"
+                result["reason"] = "SUBMISSION_NOT_CONFIRMED"
 
-                return {
-                    "status": "BLOCKED",
-                    "reason": "BROWSER_TIMEOUT",
-                    "error": str(error),
-                    "evidence": evidence,
-                }
+                return result
+
+            except Exception as error:
+
+                result["status"] = "FAILED"
+                result["reason"] = "BROWSER_WORKFLOW_ERROR"
+                result["error"] = str(error)
+                result["final_url"] = page.url
+
+                return result
 
             finally:
-                context.close()
                 browser.close()
 
-    def _discover_fields(self, page):
-        fields = []
+    # =====================================================================
+    # FIELD DISCOVERY
+    # =====================================================================
 
-        elements = page.locator(
+    def _discover_fields(self, page):
+
+        discovered = []
+
+        # -------------------------------------------------------------
+        # Standard HTML inputs
+        # -------------------------------------------------------------
+        inputs = page.locator(
             "input, textarea, select"
         )
 
-        count = elements.count()
+        count = inputs.count()
 
         for index in range(count):
-            element = elements.nth(index)
+
+            element = inputs.nth(index)
 
             try:
                 if not element.is_visible():
@@ -376,221 +489,551 @@ class WebsiteApplicationAgent:
                     "(el) => el.tagName.toLowerCase()"
                 )
 
-                field_type = element.get_attribute("type") or tag
-                name = element.get_attribute("name") or ""
-                placeholder = element.get_attribute("placeholder") or ""
-                aria = element.get_attribute("aria-label") or ""
-                element_id = element.get_attribute("id") or ""
-
-                label = (
-                    name
-                    or placeholder
-                    or aria
-                    or element_id
+                input_type = (
+                    element.get_attribute("type")
+                    or tag
                 )
 
-                if element_id:
-                    associated = page.locator(
-                        f'label[for="{element_id}"]'
+                if input_type in {
+                    "hidden",
+                    "submit",
+                    "button",
+                    "reset",
+                    "file",
+                    "checkbox",
+                    "radio",
+                }:
+                    continue
+
+                field_id = element.get_attribute("id") or ""
+                name = element.get_attribute("name") or ""
+                placeholder = (
+                    element.get_attribute("placeholder")
+                    or ""
+                )
+                aria_label = (
+                    element.get_attribute("aria-label")
+                    or ""
+                )
+
+                label = self._get_label_text(
+                    page,
+                    element,
+                )
+
+                # Google Forms commonly exposes the question
+                # through aria-label.
+                if aria_label:
+                    label = aria_label
+
+                if not label:
+                    label = (
+                        placeholder
+                        or name
+                        or field_id
+                        or f"field_{index}"
                     )
 
-                    if associated.count() > 0:
-                        label_text = associated.first.inner_text().strip()
-
-                        if label_text:
-                            label = label_text
-
-                fields.append(
+                discovered.append(
                     {
-                        "label": label,
-                        "type": field_type,
+                        "element": element,
+                        "label": label.strip(),
+                        "type": input_type,
                         "name": name,
-                        "id": element_id,
+                        "id": field_id,
                         "placeholder": placeholder,
-                        "aria_label": aria,
+                        "aria_label": aria_label,
+                        "index": index,
                     }
                 )
 
             except Exception:
                 continue
 
-        return fields
+        # -------------------------------------------------------------
+        # Google Forms enhancement
+        # -------------------------------------------------------------
+        # Google Forms questions are normally contained inside:
+        #
+        # <div role="listitem">
+        #
+        # and the question text is close to the actual input.
+        #
+        # We attach that question text to the discovered field.
+        # -------------------------------------------------------------
 
-    def _find_matching_field(self, source_field, fields):
-        source = str(source_field).strip().lower()
+        for field in discovered:
 
+            try:
+                question_text = field["element"].evaluate(
+                    """
+                    (el) => {
+                        const item =
+                            el.closest('[role="listitem"]');
+
+                        if (!item) return "";
+
+                        return item.innerText
+                            .replace(/\\n+/g, " ")
+                            .trim();
+                    }
+                    """
+                )
+
+                if question_text:
+                    field["question_text"] = question_text
+
+            except Exception:
+                field["question_text"] = ""
+
+        return discovered
+
+    # =====================================================================
+    # FIELD MATCHING
+    # =====================================================================
+
+    def _find_matching_field(
+        self,
+        page,
+        fields,
+        source_field,
+    ):
+
+        source = self._normalize(source_field)
+
+        # -------------------------------------------------------------
         # Exact match
+        # -------------------------------------------------------------
+
         for field in fields:
+
             candidates = [
                 field.get("label", ""),
+                field.get("aria_label", ""),
                 field.get("name", ""),
                 field.get("id", ""),
                 field.get("placeholder", ""),
-                field.get("aria_label", ""),
+                field.get("question_text", ""),
             ]
 
             for candidate in candidates:
-                if str(candidate).strip().lower() == source:
+
+                if self._normalize(candidate) == source:
                     return field
 
+        # -------------------------------------------------------------
         # Partial match
+        # -------------------------------------------------------------
+
         for field in fields:
+
             candidates = [
                 field.get("label", ""),
+                field.get("aria_label", ""),
                 field.get("name", ""),
                 field.get("id", ""),
                 field.get("placeholder", ""),
-                field.get("aria_label", ""),
+                field.get("question_text", ""),
+            ]
+
+            normalized_candidates = [
+                self._normalize(candidate)
+                for candidate in candidates
+                if candidate
+            ]
+
+            for candidate in normalized_candidates:
+
+                if (
+                    source in candidate
+                    or candidate in source
+                ):
+                    return field
+
+        # -------------------------------------------------------------
+        # Common field-name aliases
+        # -------------------------------------------------------------
+
+        aliases = {
+            "fullname": [
+                "name",
+                "full name",
+                "fullname",
+            ],
+            "name": [
+                "name",
+                "full name",
+                "fullname",
+            ],
+            "email": [
+                "email",
+                "email address",
+                "e-mail",
+            ],
+        }
+
+        possible = aliases.get(source, [])
+
+        for field in fields:
+
+            candidates = [
+                self._normalize(field.get("label", "")),
+                self._normalize(field.get("aria_label", "")),
+                self._normalize(field.get("name", "")),
+                self._normalize(field.get("question_text", "")),
             ]
 
             for candidate in candidates:
-                candidate = str(candidate).strip().lower()
 
-                if source in candidate or candidate in source:
-                    return field
+                for alias in possible:
+
+                    if alias in candidate:
+                        return field
 
         return None
 
-    def _get_locator(self, page, field):
-        element_id = field.get("id")
-        name = field.get("name")
-        label = field.get("label")
-        placeholder = field.get("placeholder")
+    # =====================================================================
+    # FILLING
+    # =====================================================================
 
-        if element_id:
-            locator = page.locator(
-                f"#{element_id}"
+    def _fill_field(
+        self,
+        page,
+        field,
+        value,
+    ):
+
+        element = field["element"]
+
+        try:
+            element.scroll_into_view_if_needed()
+
+            # Google Forms text fields.
+            element.fill(
+                str(value),
+                timeout=self.timeout,
             )
 
-            if locator.count() > 0:
-                return locator.first
+            # Trigger input/change events.
+            try:
+                element.dispatch_event("input")
+            except Exception:
+                pass
 
-        if name:
-            locator = page.locator(
-                f'[name="{name}"]'
+            try:
+                element.dispatch_event("change")
+            except Exception:
+                pass
+
+            return True
+
+        except Exception:
+
+            # Fallback: click + keyboard.
+            try:
+                element.click(
+                    timeout=5000
+                )
+
+                element.press("Control+A")
+
+                element.type(
+                    str(value),
+                    delay=10,
+                )
+
+                return True
+
+            except Exception:
+                return False
+
+    # =====================================================================
+    # READ-BACK
+    # =====================================================================
+
+    def _read_field(
+        self,
+        page,
+        field,
+    ):
+
+        element = field["element"]
+
+        # -------------------------------------------------------------
+        # IMPORTANT:
+        # Read the VALUE property of the EXACT SAME DOM element
+        # that was filled.
+        #
+        # This prevents Google Forms internal elements from being
+        # accidentally selected during verification.
+        # -------------------------------------------------------------
+
+        try:
+            element.scroll_into_view_if_needed()
+
+            value = element.input_value(
+                timeout=self.timeout
             )
 
-            if locator.count() > 0:
-                return locator.first
+            if value is not None:
+                return value
 
-        if placeholder:
-            locator = page.get_by_placeholder(
-                placeholder,
-                exact=True,
+        except Exception:
+            pass
+
+        # -------------------------------------------------------------
+        # JavaScript fallback
+        # -------------------------------------------------------------
+
+        try:
+            value = element.evaluate(
+                """
+                (el) => {
+                    if ("value" in el) {
+                        return el.value;
+                    }
+
+                    return el.getAttribute("value") || "";
+                }
+                """
             )
 
-            if locator.count() > 0:
-                return locator.first
+            return value or ""
 
-        if label:
-            locator = page.get_by_label(
-                label,
-                exact=False,
-            )
+        except Exception:
+            return ""
 
-            if locator.count() > 0:
-                return locator.first
-
-        raise ValueError(
-            f"Could not locate field: {field}"
-        )
-
-    def _fill_field(self, page, field, value):
-        locator = self._get_locator(page, field)
-
-        field_type = field.get("type", "").lower()
-
-        if field_type in {
-            "radio",
-            "checkbox",
-        }:
-            locator.check()
-        else:
-            locator.fill(str(value))
-
-    def _read_field(self, page, field):
-        locator = self._get_locator(page, field)
-
-        field_type = field.get("type", "").lower()
-
-        if field_type in {
-            "radio",
-            "checkbox",
-        }:
-            return str(locator.is_checked())
-
-        return locator.input_value()
+    # =====================================================================
+    # SUBMIT
+    # =====================================================================
 
     def _submit(self, page):
+
         selectors = [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            'button:has-text("Submit Application")',
             'button:has-text("Submit")',
             'button:has-text("Apply")',
             'button:has-text("Continue")',
             'button:has-text("Finish")',
+            'input[type="submit"]',
             '[role="button"]:has-text("Submit")',
+            '[role="button"]:has-text("Submit form")',
         ]
 
         for selector in selectors:
-            locator = page.locator(selector)
 
-            if locator.count() > 0:
-                visible = locator.filter(
-                    has_not=page.locator("[hidden]")
-                )
+            try:
 
-                if visible.count() > 0:
-                    visible.first.click()
-                    return
+                button = page.locator(selector).first
 
-                locator.first.click()
-                return
+                if button.is_visible():
 
-        raise ValueError(
-            "No supported submit button was found."
-        )
+                    button.scroll_into_view_if_needed()
+
+                    button.click(
+                        timeout=5000
+                    )
+
+                    return True
+
+            except Exception:
+                continue
+
+        return False
+
+    # =====================================================================
+    # SUBMISSION DETECTION
+    # =====================================================================
 
     def _detect_submission(self, page):
-        body_text = page.locator("body").inner_text().lower()
+
+        try:
+            body_text = page.locator(
+                "body"
+            ).inner_text(
+                timeout=5000
+            ).lower()
+
+        except Exception:
+            body_text = ""
 
         confirmation_phrases = [
-            "application submitted successfully",
-            "application has been submitted",
             "application submitted",
+            "application has been submitted",
             "successfully submitted",
             "submission successful",
-            "submission confirmed",
-            "your application has been submitted",
-            "thank you for applying",
+            "your response has been recorded",
             "response has been recorded",
+            "thank you for applying",
+            "thank you",
+            "success",
         ]
 
         for phrase in confirmation_phrases:
+
             if phrase in body_text:
+
                 return {
                     "confirmed": True,
-                    "text": phrase,
+                    "signal": phrase,
                 }
 
-        url = page.url.lower()
+        current_url = page.url.lower()
 
         url_indicators = [
             "success",
             "submitted",
             "confirmation",
-            "complete",
             "thank",
+            "complete",
         ]
 
-        if any(indicator in url for indicator in url_indicators):
-            return {
-                "confirmed": True,
-                "text": f"Confirmation URL: {page.url}",
-            }
+        for indicator in url_indicators:
+
+            if indicator in current_url:
+
+                return {
+                    "confirmed": True,
+                    "signal": f"url:{indicator}",
+                }
+
+        # Google Forms sometimes changes the page to a
+        # confirmation state without a useful URL.
+        try:
+
+            confirmation = page.locator(
+                'div[role="heading"]'
+            ).filter(
+                has_text="Your response has been recorded"
+            )
+
+            if confirmation.count() > 0:
+
+                return {
+                    "confirmed": True,
+                    "signal": "google_forms_confirmation",
+                }
+
+        except Exception:
+            pass
 
         return {
             "confirmed": False,
-            "text": "",
+            "signal": None,
         }
+
+    # =====================================================================
+    # LOGIN DETECTION
+    # =====================================================================
+
+    def _is_login_page(self, page):
+
+        try:
+
+            url = page.url.lower()
+
+            if "accounts.google.com" in url:
+                return True
+
+            text = page.locator(
+                "body"
+            ).inner_text(
+                timeout=3000
+            ).lower()
+
+            login_phrases = [
+                "sign in",
+                "email or phone",
+                "enter your email",
+                "forgot email",
+                "use another account",
+            ]
+
+            return any(
+                phrase in text
+                for phrase in login_phrases
+            )
+
+        except Exception:
+            return False
+
+    # =====================================================================
+    # LABEL EXTRACTION
+    # =====================================================================
+
+    def _get_label_text(
+        self,
+        page,
+        element,
+    ):
+
+        try:
+
+            element_id = (
+                element.get_attribute("id")
+            )
+
+            if element_id:
+
+                label = page.locator(
+                    f'label[for="{element_id}"]'
+                )
+
+                if label.count() > 0:
+
+                    text = label.first.inner_text()
+
+                    if text:
+                        return text.strip()
+
+        except Exception:
+            pass
+
+        try:
+
+            text = element.evaluate(
+                """
+                (el) => {
+                    const parent = el.closest(
+                        '[role="listitem"]'
+                    );
+
+                    if (!parent) return "";
+
+                    const clone = parent.cloneNode(true);
+
+                    const inputs =
+                        clone.querySelectorAll(
+                            'input, textarea, select'
+                        );
+
+                    inputs.forEach(
+                        input => input.remove()
+                    );
+
+                    return clone.innerText
+                        .replace(/\\n+/g, " ")
+                        .trim();
+                }
+                """
+            )
+
+            return text or ""
+
+        except Exception:
+            return ""
+
+    # =====================================================================
+    # NORMALIZATION
+    # =====================================================================
+
+    @staticmethod
+    def _normalize(value):
+
+        return (
+            str(value or "")
+            .strip()
+            .lower()
+            .replace("-", "")
+            .replace("_", "")
+            .replace(" ", "")
+        )

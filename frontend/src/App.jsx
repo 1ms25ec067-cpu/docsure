@@ -388,7 +388,10 @@ export default function App() {
     useState("Test User");
 
   const [browserEmail, setBrowserEmail] =
-    useState("test@example.com");
+    useState("");
+
+  const [verifiedBrowserData, setVerifiedBrowserData] =
+    useState(null);
 
   const [browserResult, setBrowserResult] =
     useState(null);
@@ -874,6 +877,41 @@ export default function App() {
     setWorkflowError("");
 
     try {
+      if (!uploadResult?.stored_path) {
+        throw new Error(
+          "Upload and verify a document first. Browser automation uses only verified document data."
+        );
+      }
+
+      // Extract structured fields from the document already uploaded to DocuSure.
+      // No name/email is typed manually into the browser workflow.
+      const sourcePath =
+        recoveryResult?.repaired_file ||
+        uploadResult.stored_path;
+
+      const verifiedData = await apiRequest(
+        `/documents/verified-fields?file_path=${encodeURIComponent(sourcePath)}`
+      );
+
+      if (verifiedData?.status !== "VERIFIED") {
+        throw new Error(
+          verifiedData?.reason ||
+            "Verified application fields could not be extracted from the document."
+        );
+      }
+
+      const fieldValues = verifiedData?.fields || {};
+
+      if (Object.keys(fieldValues).length === 0) {
+        throw new Error(
+          "No application fields were found in the verified document."
+        );
+      }
+
+      setVerifiedBrowserData(verifiedData);
+      setBrowserName(fieldValues["Full Name"] || "");
+      setBrowserEmail(fieldValues["Email Address"] || fieldValues.Email || "");
+
       const startData = await apiRequest(
         "/agent/start",
         {
@@ -903,17 +941,16 @@ export default function App() {
       setWorkflowData(startData);
 
       const browserData = await apiRequest(
-        `/agent/browser-submit/${encodeURIComponent(
-          id
-        )}?url=${encodeURIComponent(browserUrl)}`,
+        "/browser/application",
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            full_name: browserName,
-            email: browserEmail,
+            url: browserUrl,
+            field_values: fieldValues,
+            submit: true,
           }),
         }
       );
@@ -945,7 +982,7 @@ export default function App() {
 
       if (proofData?.status === "VERIFIED") {
         showToast(
-          "Website submitted and final proof created.",
+          "Verified document data submitted and final proof created.",
           "success"
         );
       } else {
@@ -968,7 +1005,7 @@ export default function App() {
       setWorkflowError(message);
 
       showToast(
-        "Website automation failed.",
+        message,
         "error"
       );
     } finally {
@@ -2358,34 +2395,38 @@ export default function App() {
                 />
               </label>
 
-              <label className="block">
-                <span className="mb-2 block text-xs font-bold uppercase tracking-wider text-slate-500">
-                  Verified Full Name
-                </span>
+              <div className="rounded-2xl border border-blue-100 bg-blue-50 p-4">
+                <p className="text-xs font-black uppercase tracking-wider text-blue-700">
+                  Data source
+                </p>
+                <p className="mt-1 text-xs leading-5 text-blue-900">
+                  Browser automation uses fields extracted from the uploaded and verified document. Nothing is manually invented for submission.
+                </p>
 
-                <input
-                  value={browserName}
-                  onChange={(event) =>
-                    setBrowserName(event.target.value)
-                  }
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-50"
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-2 block text-xs font-bold uppercase tracking-wider text-slate-500">
-                  Verified Email
-                </span>
-
-                <input
-                  type="email"
-                  value={browserEmail}
-                  onChange={(event) =>
-                    setBrowserEmail(event.target.value)
-                  }
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-blue-400 focus:ring-4 focus:ring-blue-50"
-                />
-              </label>
+                <div className="mt-3 space-y-2">
+                  {verifiedBrowserData?.fields ? (
+                    Object.entries(verifiedBrowserData.fields).map(
+                      ([key, value]) => (
+                        <div
+                          key={key}
+                          className="flex items-center justify-between gap-3 rounded-lg border border-blue-100 bg-white px-3 py-2"
+                        >
+                          <span className="text-xs font-semibold text-slate-500">
+                            {key}
+                          </span>
+                          <span className="text-xs font-bold text-slate-900">
+                            {String(value)}
+                          </span>
+                        </div>
+                      )
+                    )
+                  ) : (
+                    <p className="text-xs text-blue-800">
+                      Upload a document and click Run Application Agent to load verified fields.
+                    </p>
+                  )}
+                </div>
+              </div>
 
               <button
                 className="primary-btn w-full"
@@ -2393,8 +2434,7 @@ export default function App() {
                 disabled={
                   browserLoading ||
                   !browserUrl ||
-                  !browserName ||
-                  !browserEmail
+                  !uploadResult?.stored_path
                 }
               >
                 {browserLoading ? (
@@ -2403,12 +2443,12 @@ export default function App() {
                       size={16}
                       className="animate-spin"
                     />
-                    Running verified browser agent...
+                    Extracting verified data + running browser agent...
                   </>
                 ) : (
                   <>
                     <Send size={16} />
-                    Run Application Agent
+                    Run From Verified Document
                   </>
                 )}
               </button>
